@@ -1,4 +1,5 @@
-﻿using System;
+﻿using NormalMap_Iyahon;
+using System;
 using System.IO;
 using System.Numerics;
 using Vortice.DCommon;
@@ -15,6 +16,7 @@ namespace NormalMap_Iyahon
         private readonly IGraphicsDevicesAndContext _devices;
         private readonly NormalMapEffect _item;
 
+
         private ID2D1Image? _input;
 
         private AffineTransform2D? _transformEffect;
@@ -28,12 +30,15 @@ namespace NormalMap_Iyahon
 
         private Composite? _maskEffect;
 
-        // ★修正: ファイル用Bitmapだけにする
-        private ID2D1Bitmap? _fileBitmap;
-
-        private ID2D1Bitmap? _flatNormalBitmap;
-        private ID2D1Bitmap? _flatHeightBitmap;
+        // ★変更: WICビットマップを保持 (デバイス非依存)
+        private Vortice.WIC.IWICBitmapSource? _wicBitmap;
         private string _loadedPath = string.Empty;
+
+        // 連携用 (ID2D1Imageはエフェクト出力なのでデバイス依存だが、生成側と同じデバイスならOK)
+        // ※スクリーンショット時はデバイスが変わるので連携画像は使えなくなる可能性があるが、
+        //   今回はファイル画像のクラッシュ回避を最優先とする。
+        private ID2D1Image? _linkedImage;
+
         private ID2D1Image? _lastOutput;
 
         public NormalMapEffectProcessor(IGraphicsDevicesAndContext devices, NormalMapEffect item)
@@ -62,7 +67,7 @@ namespace NormalMap_Iyahon
             var frame = desc.ItemPosition.Frame;
             var len = desc.ItemDuration.Frame;
             var fps = desc.FPS;
-            var dc = _devices.DeviceContext;
+            var dc = _devices.DeviceContext; // 現在の描画コンテキスト
 
             // 1. 光源計算
             int id = (int)_item.LightId.GetValue(frame, len, fps);
@@ -87,37 +92,55 @@ namespace NormalMap_Iyahon
                                            Matrix4x4.CreateRotationX(-radX);
 
                 if (lightType == LightType.Point)
-                {
-                    Vector3 relativePos = finalLightPos - itemPos;
-                    finalLightPos = Vector3.Transform(relativePos, rotationMatrix);
-                }
+                    finalLightPos = Vector3.Transform(finalLightPos - itemPos, rotationMatrix);
                 else
-                {
                     finalLightPos = Vector3.Transform(finalLightPos, rotationMatrix);
-                }
 
                 if (itemScale.X < 0) finalLightPos.X *= -1;
                 if (itemScale.Y < 0) finalLightPos.Y *= -1;
             }
 
-            // 2. リソース準備
-            UpdateNormalMapResource();
+            // 2. リソース準備 (WICロード / 連携取得)
+            UpdateNormalMapResource(frame, len, fps);
 
-            // ★修正: 連携分岐削除
+            // ★重要: 現在のデバイスコンテキストで使える Bitmap/Image を用意する
             ID2D1Image mapImage;
-            if (_fileBitmap != null)
-                mapImage = _fileBitmap;
-            else
-                mapImage = (_item.Type == MapType.Normal) ? GetFlatNormalBitmap() : GetFlatHeightBitmap();
+            ID2D1Bitmap? tempBitmap = null; // 使い終わったら捨てる用
 
-            // 3. 配置・変形
+            if (_linkedImage != null)
+            {
+                // 連携画像 (生成側も同じデバイスであることを祈る。通常は同じ)
+                mapImage = _linkedImage;
+            }
+            else if (_wicBitmap != null)
+            {
+                // ★修正: WICへの同時アクセスを防ぐためにロックする
+                // TextureManagerで共有されているインスタンスなので、他のアイテム（スレッド）と競合する可能性がある
+                lock (_wicBitmap)
+                {
+                    tempBitmap = dc.CreateBitmapFromWicBitmap(_wicBitmap, null);
+                }
+                mapImage = tempBitmap;
+            }
+            else
+            {
+                // ダミー生成 (現在のdcで作る)
+                tempBitmap = (_item.Type == MapType.Normal) ? GetFlatNormalBitmap(dc) : GetFlatHeightBitmap(dc);
+                mapImage = tempBitmap;
+            }
+
+            // --- 3. 配置・変形 ---
             var inputBounds = dc.GetImageLocalBounds(_input);
             float inputW = inputBounds.Right - inputBounds.Left;
             float inputH = inputBounds.Bottom - inputBounds.Top;
 
-            if (inputW <= 0 || inputH <= 0) return desc.DrawDescription;
+            if (inputW <= 0 || inputH <= 0)
+            {
+                tempBitmap?.Dispose(); // 早期リターン時も解放
+                return desc.DrawDescription;
+            }
 
-            var mapBounds = dc.GetImageLocalBounds(mapImage);
+            var mapBounds = dc.GetImageLocalBounds(mapImage); // エラーにならない！
             float mapW = mapBounds.Right - mapBounds.Left;
             float mapH = mapBounds.Bottom - mapBounds.Top;
 
@@ -175,21 +198,19 @@ namespace NormalMap_Iyahon
                 scale /= 20.0f;
             }
 
-            // 4. エフェクト適用
+            // --- 4. エフェクト適用 ---
             using (var transformedMap = _transformEffect.Output)
             {
                 if (_item.Type == MapType.Normal)
                 {
                     _customEffect!.SetInput(0, _input, true);
                     _customEffect!.SetInput(1, transformedMap, true);
-
                     _customEffect.LightPos = finalLightPos;
                     _customEffect.Intensity = intensity;
                     _customEffect.LightColor = lightColor;
                     _customEffect.Ambient = ambient;
                     _customEffect.Depth = scale;
                     _customEffect.LightType = (lightType == LightType.Directional) ? 1.0f : 0.0f;
-
                     _lastOutput = _customEffect.Output;
                 }
                 else
@@ -232,13 +253,11 @@ namespace NormalMap_Iyahon
                             _maskEffect!.SetInput(0, rawLightMap, true);
                             _maskEffect!.SetInput(1, _input, true);
                             _maskEffect!.Mode = CompositeMode.DestinationIn;
-
                             using (var clippedLightMap = _maskEffect.Output)
                             {
                                 _compositeEffect!.SetInput(0, _input, true);
                                 _compositeEffect!.SetInput(1, clippedLightMap, true);
                                 _compositeEffect.Coefficients = new Vector4(intensity, 0, ambient, 0);
-
                                 _lastOutput = _compositeEffect.Output;
                             }
                         }
@@ -246,57 +265,59 @@ namespace NormalMap_Iyahon
                 }
             }
 
+            // ★重要: 作成した一時的なBitmapを解放
+            tempBitmap?.Dispose();
+
             return desc.DrawDescription;
         }
 
         public ID2D1Image Output => _lastOutput ?? _input!;
-
         public void SetInput(ID2D1Image? input) { _input = input; }
         public void ClearInput() { _input = null; }
 
-        private void UpdateNormalMapResource()
+        private void UpdateNormalMapResource(int frame, int len, int fps)
         {
-            // 単純なファイルロードのみ
+            _linkedImage = null;
+
+            // ファイルモード
             string path = _item.NormalMapPath;
-            if (path == _loadedPath && _fileBitmap != null) return;
+            if (path == _loadedPath && _wicBitmap != null) return;
 
             if (!string.IsNullOrEmpty(_loadedPath))
             {
                 TextureManager.ReleaseTexture(_loadedPath);
-                _fileBitmap = null;
+                _wicBitmap = null;
             }
 
             _loadedPath = path;
 
             if (!string.IsNullOrEmpty(path))
             {
-                _fileBitmap = TextureManager.LoadTexture(_devices.DeviceContext, path);
+                _wicBitmap = TextureManager.LoadTexture(path); // dc不要
             }
         }
 
-        private ID2D1Bitmap GetFlatNormalBitmap()
+        // ★修正: ダミー生成も dc を受け取ってその場で作る
+        private ID2D1Bitmap GetFlatNormalBitmap(ID2D1DeviceContext dc)
         {
-            if (_flatNormalBitmap != null) return _flatNormalBitmap;
             int size = 16; var pixelColor = new byte[] { 255, 128, 128, 255 };
-            return CreateDummyBitmap(size, pixelColor, ref _flatNormalBitmap);
+            return CreateDummyBitmap(dc, size, pixelColor);
         }
 
-        private ID2D1Bitmap GetFlatHeightBitmap()
+        private ID2D1Bitmap GetFlatHeightBitmap(ID2D1DeviceContext dc)
         {
-            if (_flatHeightBitmap != null) return _flatHeightBitmap;
             int size = 16; var pixelColor = new byte[] { 0, 0, 0, 255 };
-            return CreateDummyBitmap(size, pixelColor, ref _flatHeightBitmap);
+            return CreateDummyBitmap(dc, size, pixelColor);
         }
 
-        private ID2D1Bitmap CreateDummyBitmap(int size, byte[] color, ref ID2D1Bitmap? target)
+        private ID2D1Bitmap CreateDummyBitmap(ID2D1DeviceContext dc, int size, byte[] color)
         {
             byte[] pixels = new byte[size * size * 4];
             for (int i = 0; i < pixels.Length; i += 4) { pixels[i + 0] = color[0]; pixels[i + 1] = color[1]; pixels[i + 2] = color[2]; pixels[i + 3] = color[3]; }
             var sizeI = new Vortice.Mathematics.SizeI(size, size);
             var pixelFormat = new Vortice.DCommon.PixelFormat(Vortice.DXGI.Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied);
             var props = new BitmapProperties(pixelFormat);
-            unsafe { fixed (byte* p = pixels) { target = _devices.DeviceContext.CreateBitmap(sizeI, (IntPtr)p, size * 4, props); } }
-            return target!;
+            unsafe { fixed (byte* p = pixels) { return dc.CreateBitmap(sizeI, (IntPtr)p, size * 4, props); } }
         }
 
         public void Dispose()
@@ -304,43 +325,30 @@ namespace NormalMap_Iyahon
             if (!string.IsNullOrEmpty(_loadedPath))
             {
                 TextureManager.ReleaseTexture(_loadedPath);
-                _fileBitmap = null;
+                _wicBitmap = null;
                 _loadedPath = string.Empty;
             }
 
             _lastOutput?.Dispose();
             _lastOutput = null;
 
-            _transformEffect?.SetInput(0, null, true);
-            _transformEffect?.Dispose();
+            // _linkedImage は生成側の所有物なのでDisposeしない
 
-            _blurEffect?.SetInput(0, null, true);
-            _blurEffect?.Dispose();
+            _transformEffect?.SetInput(0, null, true); _transformEffect?.Dispose();
+            _blurEffect?.SetInput(0, null, true); _blurEffect?.Dispose();
+            _customEffect?.SetInput(0, null, true); _customEffect?.SetInput(1, null, true); _customEffect?.Dispose();
+            _lumToAlphaEffect?.SetInput(0, null, true); _lumToAlphaEffect?.Dispose();
+            _diffuseEffect?.SetInput(0, null, true); _diffuseEffect?.Dispose();
+            _distantDiffuseEffect?.SetInput(0, null, true); _distantDiffuseEffect?.Dispose();
+            _compositeEffect?.SetInput(0, null, true); _compositeEffect?.SetInput(1, null, true); _compositeEffect?.Dispose();
+            _maskEffect?.SetInput(0, null, true); _maskEffect?.SetInput(1, null, true); _maskEffect?.Dispose();
 
-            _customEffect?.SetInput(0, null, true);
-            _customEffect?.SetInput(1, null, true);
-            _customEffect?.Dispose();
-
-            _lumToAlphaEffect?.SetInput(0, null, true);
-            _lumToAlphaEffect?.Dispose();
-
-            _diffuseEffect?.SetInput(0, null, true);
-            _diffuseEffect?.Dispose();
-
-            _distantDiffuseEffect?.SetInput(0, null, true);
-            _distantDiffuseEffect?.Dispose();
-
-            _compositeEffect?.SetInput(0, null, true);
-            _compositeEffect?.SetInput(1, null, true);
-            _compositeEffect?.Dispose();
-
-            _maskEffect?.SetInput(0, null, true);
-            _maskEffect?.SetInput(1, null, true);
-            _maskEffect?.Dispose();
-
-            _flatNormalBitmap?.Dispose();
-            _flatHeightBitmap?.Dispose();
+            // ダミーキャッシュ変数はもう使わないので削除
+            // _flatNormalBitmap?.Dispose(); 
+            // _flatHeightBitmap?.Dispose(); 
         }
     }
+
+
 
 }

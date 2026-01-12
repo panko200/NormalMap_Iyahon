@@ -43,8 +43,8 @@ namespace NormalMap_Iyahon
 
         [Display(GroupName = "光", Name = "色", Description = "光の色")]
         [ColorPicker]
-        public Color LightColor { get => lightColor; set => Set(ref lightColor, value); }
-        private Color lightColor = Colors.White;
+        public System.Windows.Media.Color LightColor { get => lightColor; set => Set(ref lightColor, value); }
+        private System.Windows.Media.Color lightColor = Colors.White;
 
         [Display(GroupName = "簡易描画", Name = "このアイテムにも適用", Description = "ONにすると、このアイテム自体にライティングを適用します。")]
         [ToggleSlider]

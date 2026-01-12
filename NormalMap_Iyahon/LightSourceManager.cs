@@ -131,8 +131,8 @@ namespace NormalMap_Iyahon
 
         private static LightData? ScanTimelineForLight(int targetId)
         {
-            if (Application.Current == null) return null;
-            var mainWindow = Application.Current.Windows.OfType<Window>().FirstOrDefault(w => w.GetType().FullName == "YukkuriMovieMaker.Views.MainView");
+            if (System.Windows.Application.Current == null) return null;
+            var mainWindow = System.Windows.Application.Current.Windows.OfType<Window>().FirstOrDefault(w => w.GetType().FullName == "YukkuriMovieMaker.Views.MainView");
             if (mainWindow == null) return null;
 
             var mainVM = mainWindow.DataContext;
